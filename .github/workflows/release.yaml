@@ -1,0 +1,14 @@
+on:
+  push:
+    tags:
+      - discourse-webhook/*
+
+jobs:
+  release-ddiscourse-webhook-image:
+    uses: concordium/.github/.github/workflows/docker-release-workflow.yaml@main
+    with:
+      SERVICE_NAME: "discourse-webhook"
+      BUILD_ARGS: |
+        build_image=python:3.8-slim
+      DOCKER_FILE_PATH: Dockerfile
+    secrets: inherit
