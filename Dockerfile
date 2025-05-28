@@ -1,5 +1,6 @@
 # Use a slim Python base image
-FROM python:3.8-slim
+ARG build_image="python:3.8-slim"
+FROM ${build_image}
 
 # Set working directory
 WORKDIR /app
