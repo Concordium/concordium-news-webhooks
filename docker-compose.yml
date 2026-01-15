@@ -1,11 +1,20 @@
-version: '3.8'
+version: "3.8"
 
 services:
-  webhook:
+  discourse-webhook:
     build: .
     container_name: discourse-webhook
+    env_file:
+      - .env
     ports:
       - "5000:5000"
+    restart: unless-stopped
+    command: ["python", "src/discourse_webhook.py"]
+
+  telegram-bridge:
+    build: .
+    container_name: telegram-discord-bridge
     env_file:
       - .env
     restart: unless-stopped
+    command: ["python", "src/telegram_bridge.py"]

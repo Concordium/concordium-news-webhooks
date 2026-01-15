@@ -1,19 +1,10 @@
-# Use a slim Python base image
-ARG build_image="python:3.8-slim"
-FROM ${build_image}
+FROM python:3.12-slim
 
-# Set working directory
 WORKDIR /app
 
-# Copy requirements (explicitly or just install inline)
-COPY requirements.txt requirements.txt
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy app files
-COPY . .
+COPY src/ ./src/
 
-# Expose the port the app runs on
-EXPOSE 5000
-
-# Run the Flask app
-CMD ["python", "webhook.py"]
+ENV PYTHONUNBUFFERED=1
