@@ -3,24 +3,21 @@ telegram_bridge.py
 
 Telegram Channel -> Discord Webhook bridge (Python)
 - Listens to Telegram channel posts (channel_post)
-- Forwards text + media (photo/video/gif/document/etc.) to Discord via a *dedicated* Discord webhook
-- Makes the channel title in Discord clickable using TELEGRAM_CHANNEL_URL (invite link for private channels)
+- Forwards text + media (photo/video/gif/document/etc.) to Discord via a dedicated Discord webhook
+- Preserves Telegram "text links" (hyperlinks) by converting them to Discord-friendly Markdown links
 
 Env vars:
   TG_BOT_TOKEN
   TELEGRAM_DISCORD_WEBHOOK_URL
   TELEGRAM_CHANNEL_URL
   DISCORD_MAX_FILE_BYTES (optional, default 8MB)
-
-Requirements:
-  pip install python-telegram-bot==21.6 requests
 """
 
 import io
 import os
 import json
 import logging
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List, Dict, Any
 
 import requests
 from telegram import Update
@@ -39,23 +36,146 @@ TELEGRAM_CHANNEL_URL = os.getenv("TELEGRAM_CHANNEL_URL")
 # Conservative default (8MB). Can be higher on boosted servers.
 DISCORD_MAX_FILE_BYTES = int(os.getenv("DISCORD_MAX_FILE_BYTES", str(8 * 1024 * 1024)))
 
+def _utf16_offset_to_py_index(s: str, utf16_offset: int) -> int:
+    """
+    Telegram entity offsets are in UTF-16 code units.
+    Convert a UTF-16 offset to a Python string index.
+    """
+    if utf16_offset <= 0:
+        return 0
+
+    count = 0
+    for i, ch in enumerate(s):
+        # UTF-16 code units: 1 for BMP, 2 for astral symbols (emoji etc.)
+        count += 2 if ord(ch) > 0xFFFF else 1
+        if count > utf16_offset:
+            # Offset points into this character (shouldn't happen for valid entities),
+            # but return current index as best effort.
+            return i
+        if count == utf16_offset:
+            return i + 1
+    return len(s)
+
+
+def _apply_telegram_entities_to_discord_markdown(text: str, entities: list) -> str:
+    """
+    Convert Telegram message entities to Discord-friendly Markdown.
+    Preserves hyperlinks and basic formatting (bold/italic/underline/strike/code/pre).
+
+    Minimal "80% improvement":
+    - If a TEXT_LINK shares the exact same range with formatting (e.g., bold),
+      produce combined markdown like **[text](url)** to avoid broken rendering.
+
+    Correctly handles Telegram offsets (UTF-16).
+    """
+    if not text or not entities:
+        return text
+
+    wrappers = {
+        "bold": ("**", "**"),
+        "italic": ("*", "*"),
+        "underline": ("__", "__"),
+        "strikethrough": ("~~", "~~"),
+        "code": ("`", "`"),
+    }
+
+    supported = {
+        "text_link", "url", "bold", "italic", "underline", "strikethrough", "code", "pre"
+    }
+    ents = [e for e in entities if getattr(e, "type", None) in supported]
+    if not ents:
+        return text
+
+    # Group entities by (offset, length) to combine TEXT_LINK + formatting on same range.
+    by_range = {}
+    for e in ents:
+        key = (getattr(e, "offset", None), getattr(e, "length", None))
+        if key[0] is None or key[1] is None:
+            continue
+        by_range.setdefault(key, []).append(e)
+
+    # We'll process each range once, from end to start.
+    ranges = sorted(by_range.keys(), key=lambda k: k[0], reverse=True)
+
+    rendered = text
+    for offset, length in ranges:
+        # Convert UTF-16 offsets to Python indices in the *current* rendered string.
+        start = _utf16_offset_to_py_index(rendered, offset)
+        end = _utf16_offset_to_py_index(rendered, offset + length)
+
+        if start < 0 or end < 0 or start >= end or end > len(rendered):
+            continue
+
+        segment = rendered[start:end]
+        group = by_range[(offset, length)]
+
+        # If it's a URL entity, keep as-is (Discord will link it).
+        # But URL can coexist with formatting; Telegram usually uses TEXT_LINK for styled links.
+        if any(getattr(e, "type", None) == "url" for e in group) and not any(
+            getattr(e, "type", None) == "text_link" for e in group
+        ):
+            # Apply formatting wrappers if any (rare for 'url' entity)
+            fmt_types = [getattr(e, "type", None) for e in group if getattr(e, "type", None) in wrappers]
+            # Apply at most one wrapper to avoid weird combos; choose bold > italic > underline > strike > code
+            priority = ["bold", "italic", "underline", "strikethrough", "code"]
+            chosen = next((t for t in priority if t in fmt_types), None)
+            if chosen:
+                pre, suf = wrappers[chosen]
+                replacement = f"{pre}{segment}{suf}"
+                rendered = rendered[:start] + replacement + rendered[end:]
+            continue
+
+        # Handle PRE (code block) first — it should not be wrapped by bold etc.
+        pre_entity = next((e for e in group if getattr(e, "type", None) == "pre"), None)
+        if pre_entity:
+            lang = getattr(pre_entity, "language", None)
+            if lang:
+                replacement = f"```{lang}\n{segment}\n```"
+            else:
+                replacement = f"```\n{segment}\n```"
+            rendered = rendered[:start] + replacement + rendered[end:]
+            continue
+
+        # Build base replacement: either plain segment or markdown link
+        text_link_entity = next((e for e in group if getattr(e, "type", None) == "text_link"), None)
+        if text_link_entity and getattr(text_link_entity, "url", None):
+            url = getattr(text_link_entity, "url")
+            base = f"[{segment}]({url})"
+        else:
+            base = segment
+
+        # Apply ONE wrapper if present (covers 80% case: bold link, italic link, etc.)
+        fmt_types = [getattr(e, "type", None) for e in group if getattr(e, "type", None) in wrappers]
+        priority = ["bold", "italic", "underline", "strikethrough", "code"]
+        chosen = next((t for t in priority if t in fmt_types), None)
+
+        if chosen:
+            pre, suf = wrappers[chosen]
+            replacement = f"{pre}{base}{suf}"
+        else:
+            replacement = base
+
+        rendered = rendered[:start] + replacement + rendered[end:]
+
+    return rendered
 
 def build_discord_content(update: Update) -> str:
-    chat = update.effective_chat
     msg = update.effective_message
 
-    chat_title = getattr(chat, "title", None) or "Telegram Channel"
-    text = msg.text or msg.caption or ""
-    if not text:
-        text = "(media-only post)"
+    raw_text = msg.text or msg.caption or ""
+    if not raw_text:
+        raw_text = "(media-only post)"
 
-    # Clickable channel title (useful for private channels via invite link)
+    entities = msg.entities if msg.text else msg.caption_entities
+    text = _apply_telegram_entities_to_discord_markdown(raw_text, entities or [])
+
+    lines = [text]
+
+    # Branded Telegram subscribe link (Markdown, does not steal Discord embed)
     if TELEGRAM_CHANNEL_URL:
-        header = f"[{chat_title}]({TELEGRAM_CHANNEL_URL})"
-    else:
-        header = f"**{chat_title}**"
+        lines.append(f"\n[Concordium News — subscribe](<{TELEGRAM_CHANNEL_URL}>)")
 
-    return "\n".join([header, text])
+    return "\n".join(lines)
 
 
 def pick_telegram_media(update: Update) -> Optional[Tuple[str, str, Optional[int]]]:
@@ -67,12 +187,10 @@ def pick_telegram_media(update: Update) -> Optional[Tuple[str, str, Optional[int
     if not msg:
         return None
 
-    # Photo: take the largest available size
     if msg.photo:
         photo = msg.photo[-1]
         return (photo.file_id, f"photo_{msg.message_id}.jpg", getattr(photo, "file_size", None))
 
-    # Video
     if msg.video:
         v = msg.video
         return (
@@ -81,35 +199,29 @@ def pick_telegram_media(update: Update) -> Optional[Tuple[str, str, Optional[int
             getattr(v, "file_size", None),
         )
 
-    # Animation (GIF usually arrives as animation, often mp4)
     if msg.animation:
         a = msg.animation
         name = getattr(a, "file_name", None) or f"animation_{msg.message_id}.mp4"
         return (a.file_id, name, getattr(a, "file_size", None))
 
-    # Document (any file, including GIF-as-document)
     if msg.document:
         d = msg.document
         name = getattr(d, "file_name", None) or f"document_{msg.message_id}"
         return (d.file_id, name, getattr(d, "file_size", None))
 
-    # Audio
     if msg.audio:
         a = msg.audio
         name = getattr(a, "file_name", None) or f"audio_{msg.message_id}.mp3"
         return (a.file_id, name, getattr(a, "file_size", None))
 
-    # Voice
     if msg.voice:
         v = msg.voice
         return (v.file_id, f"voice_{msg.message_id}.ogg", getattr(v, "file_size", None))
 
-    # Video note
     if msg.video_note:
         vn = msg.video_note
         return (vn.file_id, f"video_note_{msg.message_id}.mp4", getattr(vn, "file_size", None))
 
-    # Sticker (static .webp or video .webm)
     if msg.sticker:
         s = msg.sticker
         ext = "webm" if getattr(s, "is_video", False) else "webp"
@@ -125,7 +237,6 @@ async def send_to_discord(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     content = build_discord_content(update)
     media = pick_telegram_media(update)
 
-    # No media: send plain message
     if not media:
         r = requests.post(TELEGRAM_DISCORD_WEBHOOK_URL, json={"content": content}, timeout=15)
         if r.status_code >= 300:
@@ -134,7 +245,6 @@ async def send_to_discord(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     file_id, filename, file_size = media
 
-    # If Telegram gave size and it's above Discord limit: send text only with a note
     if file_size is not None and file_size > DISCORD_MAX_FILE_BYTES:
         note = f"\n\n*(Media skipped: {file_size} bytes > Discord limit {DISCORD_MAX_FILE_BYTES} bytes)*"
         r = requests.post(TELEGRAM_DISCORD_WEBHOOK_URL, json={"content": content + note}, timeout=15)
@@ -142,13 +252,11 @@ async def send_to_discord(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             raise RuntimeError(f"Discord webhook error: {r.status_code} {r.text}")
         return
 
-    # Download file from Telegram into memory
     tg_file = await context.bot.get_file(file_id)
     buf = io.BytesIO()
     await tg_file.download_to_memory(out=buf)
     buf.seek(0)
 
-    # Discord webhook multipart upload
     payload_json = {"content": content}
     files = {"files[0]": (filename, buf.read())}
     data = {"payload_json": json.dumps(payload_json)}
@@ -174,7 +282,6 @@ def main() -> None:
 
     app = Application.builder().token(TG_BOT_TOKEN).build()
 
-    # Listen only to channel posts
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL, handle_channel_post))
 
     log.info("Telegram bridge started. Forwarding channel posts to Discord...")
