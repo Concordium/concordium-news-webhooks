@@ -1,13 +1,13 @@
 on:
   push:
     tags:
-      - discourse-webhook/*
+      - concordium-news-webhooks/*
 
 jobs:
-  release-ddiscourse-webhook-image:
+  release-concordium-news-webhooks-image:
     uses: concordium/.github/.github/workflows/docker-release-workflow.yaml@v1
     with:
-      SERVICE_NAME: "discourse-webhook"
+      SERVICE_NAME: "concordium-news-webhooks"
       BUILD_ARGS: |
         build_image=python:3.8-slim
       DOCKER_FILE_PATH: Dockerfile
