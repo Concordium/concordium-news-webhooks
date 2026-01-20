@@ -4,7 +4,7 @@ on:
       - concordium-news-webhooks/*
 
 jobs:
-  release-ddiscourse-webhook-image:
+  release-concordium-news-webhooks-image:
     uses: concordium/.github/.github/workflows/docker-release-workflow.yaml@v1
     with:
       SERVICE_NAME: "concordium-news-webhooks"
