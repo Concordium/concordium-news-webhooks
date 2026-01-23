@@ -5,6 +5,7 @@ Telegram Channel -> Discord Webhook bridge (Python)
 - Listens to Telegram channel posts (channel_post)
 - Forwards text + media (photo/video/gif/document/etc.) to Discord via a dedicated Discord webhook
 - Preserves Telegram "text links" (hyperlinks) by converting them to Discord-friendly Markdown links
+- Sends Discord webhook requests asynchronously via httpx.AsyncClient
 
 Env vars:
   TG_BOT_TOKEN
@@ -17,9 +18,10 @@ import io
 import os
 import json
 import logging
-from typing import Optional, Tuple, List, Dict, Any
+import asyncio
+from typing import Optional, Tuple, List, Any
 
-import requests
+import httpx
 from telegram import Update
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
@@ -36,6 +38,43 @@ TELEGRAM_CHANNEL_URL = os.getenv("TELEGRAM_CHANNEL_URL")
 # Conservative default (8MB). Can be higher on boosted servers.
 DISCORD_MAX_FILE_BYTES = int(os.getenv("DISCORD_MAX_FILE_BYTES", str(8 * 1024 * 1024)))
 
+http_client: httpx.AsyncClient | None = None
+
+
+async def get_http_client() -> httpx.AsyncClient:
+    global http_client
+    if http_client is None:
+        http_client = httpx.AsyncClient(timeout=30)
+    return http_client
+
+
+async def post_to_discord_webhook(client: httpx.AsyncClient, **kwargs) -> httpx.Response:
+    for attempt in range(3):
+        try:
+            r = await client.post(TELEGRAM_DISCORD_WEBHOOK_URL, **kwargs)
+            r.raise_for_status()
+            return r
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code
+            # Retry on rate limit or server errors only
+            if status != 429 and status < 500:
+                raise
+            if attempt == 2:
+                raise
+        except httpx.RequestError:
+            if attempt == 2:
+                raise
+
+        await asyncio.sleep(2 ** attempt)
+
+
+async def close_http_client(_: Application) -> None:
+    global http_client
+    if http_client is not None:
+        await http_client.aclose()
+        http_client = None
+
+
 def _utf16_offset_to_py_index(s: str, utf16_offset: int) -> int:
     """
     Telegram entity offsets are in UTF-16 code units.
@@ -46,60 +85,40 @@ def _utf16_offset_to_py_index(s: str, utf16_offset: int) -> int:
 
     count = 0
     for i, ch in enumerate(s):
-        # UTF-16 code units: 1 for BMP, 2 for astral symbols (emoji etc.)
         count += 2 if ord(ch) > 0xFFFF else 1
         if count > utf16_offset:
-            # Offset points into this character (shouldn't happen for valid entities),
-            # but return current index as best effort.
             return i
         if count == utf16_offset:
             return i + 1
     return len(s)
 
 
-def _apply_telegram_entities_to_discord_markdown(text: str, entities: list) -> str:
+def _apply_telegram_entities_to_discord_markdown(text: str, entities: List[Any]) -> str:
     """
     Convert Telegram message entities to Discord-friendly Markdown.
-    Preserves hyperlinks and basic formatting (bold/italic/underline/strike/code/pre).
-
-    Minimal "80% improvement":
-    - If a TEXT_LINK shares the exact same range with formatting (e.g., bold),
-      produce combined markdown like **[text](url)** to avoid broken rendering.
-
-    Correctly handles Telegram offsets (UTF-16).
+    Preserves hyperlinks (TEXT_LINK) by converting them to [text](url).
+    Correctly handles Telegram offsets (UTF-16) to avoid broken ranges.
     """
     if not text or not entities:
         return text
 
-    wrappers = {
-        "bold": ("**", "**"),
-        "italic": ("*", "*"),
-        "underline": ("__", "__"),
-        "strikethrough": ("~~", "~~"),
-        "code": ("`", "`"),
-    }
-
-    supported = {
-        "text_link", "url", "bold", "italic", "underline", "strikethrough", "code", "pre"
-    }
-    ents = [e for e in entities if getattr(e, "type", None) in supported]
-    if not ents:
+    try:
+        ents = sorted(
+            [e for e in entities if getattr(e, "type", None) in ("text_link", "url")],
+            key=lambda e: getattr(e, "offset", 0),
+            reverse=True,
+        )
+    except Exception:
         return text
 
-    # Group entities by (offset, length) to combine TEXT_LINK + formatting on same range.
-    by_range = {}
-    for e in ents:
-        key = (getattr(e, "offset", None), getattr(e, "length", None))
-        if key[0] is None or key[1] is None:
-            continue
-        by_range.setdefault(key, []).append(e)
-
-    # We'll process each range once, from end to start.
-    ranges = sorted(by_range.keys(), key=lambda k: k[0], reverse=True)
-
     rendered = text
-    for offset, length in ranges:
-        # Convert UTF-16 offsets to Python indices in the *current* rendered string.
+    for e in ents:
+        etype = getattr(e, "type", None)
+        offset = getattr(e, "offset", None)
+        length = getattr(e, "length", None)
+        if offset is None or length is None:
+            continue
+
         start = _utf16_offset_to_py_index(rendered, offset)
         end = _utf16_offset_to_py_index(rendered, offset + length)
 
@@ -107,57 +126,19 @@ def _apply_telegram_entities_to_discord_markdown(text: str, entities: list) -> s
             continue
 
         segment = rendered[start:end]
-        group = by_range[(offset, length)]
 
-        # If it's a URL entity, keep as-is (Discord will link it).
-        # But URL can coexist with formatting; Telegram usually uses TEXT_LINK for styled links.
-        if any(getattr(e, "type", None) == "url" for e in group) and not any(
-            getattr(e, "type", None) == "text_link" for e in group
-        ):
-            # Apply formatting wrappers if any (rare for 'url' entity)
-            fmt_types = [getattr(e, "type", None) for e in group if getattr(e, "type", None) in wrappers]
-            # Apply at most one wrapper to avoid weird combos; choose bold > italic > underline > strike > code
-            priority = ["bold", "italic", "underline", "strikethrough", "code"]
-            chosen = next((t for t in priority if t in fmt_types), None)
-            if chosen:
-                pre, suf = wrappers[chosen]
-                replacement = f"{pre}{segment}{suf}"
-                rendered = rendered[:start] + replacement + rendered[end:]
-            continue
-
-        # Handle PRE (code block) first — it should not be wrapped by bold etc.
-        pre_entity = next((e for e in group if getattr(e, "type", None) == "pre"), None)
-        if pre_entity:
-            lang = getattr(pre_entity, "language", None)
-            if lang:
-                replacement = f"```{lang}\n{segment}\n```"
-            else:
-                replacement = f"```\n{segment}\n```"
+        if etype == "text_link":
+            url = getattr(e, "url", None)
+            if not url:
+                continue
+            replacement = f"[{segment}]({url})"
             rendered = rendered[:start] + replacement + rendered[end:]
+
+        elif etype == "url":
             continue
-
-        # Build base replacement: either plain segment or markdown link
-        text_link_entity = next((e for e in group if getattr(e, "type", None) == "text_link"), None)
-        if text_link_entity and getattr(text_link_entity, "url", None):
-            url = getattr(text_link_entity, "url")
-            base = f"[{segment}]({url})"
-        else:
-            base = segment
-
-        # Apply ONE wrapper if present (covers 80% case: bold link, italic link, etc.)
-        fmt_types = [getattr(e, "type", None) for e in group if getattr(e, "type", None) in wrappers]
-        priority = ["bold", "italic", "underline", "strikethrough", "code"]
-        chosen = next((t for t in priority if t in fmt_types), None)
-
-        if chosen:
-            pre, suf = wrappers[chosen]
-            replacement = f"{pre}{base}{suf}"
-        else:
-            replacement = base
-
-        rendered = rendered[:start] + replacement + rendered[end:]
 
     return rendered
+
 
 def build_discord_content(update: Update) -> str:
     msg = update.effective_message
@@ -171,7 +152,7 @@ def build_discord_content(update: Update) -> str:
 
     lines = [text]
 
-    # Branded Telegram subscribe link (Markdown, does not steal Discord embed)
+    # Branded Telegram subscribe link (Markdown, wrapped in <...> to prevent Discord embed)
     if TELEGRAM_CHANNEL_URL:
         lines.append(f"\n[Concordium News — subscribe](<{TELEGRAM_CHANNEL_URL}>)")
 
@@ -237,33 +218,56 @@ async def send_to_discord(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     content = build_discord_content(update)
     media = pick_telegram_media(update)
 
+    client = await get_http_client()
+
+    # No media: send plain message
     if not media:
-        r = requests.post(TELEGRAM_DISCORD_WEBHOOK_URL, json={"content": content}, timeout=15)
-        if r.status_code >= 300:
-            raise RuntimeError(f"Discord webhook error: {r.status_code} {r.text}")
+        try:
+            await post_to_discord_webhook(client, json={"content": content})
+        except httpx.RequestError as e:
+            raise RuntimeError(f"Discord webhook request error: {e}") from e
+        except httpx.HTTPStatusError as e:
+            raise RuntimeError(
+                f"Discord webhook error: {e.response.status_code} {e.response.text}"
+            ) from e
         return
 
     file_id, filename, file_size = media
 
+    # If Telegram gave size and it's above Discord limit: send text only with a note
     if file_size is not None and file_size > DISCORD_MAX_FILE_BYTES:
         note = f"\n\n*(Media skipped: {file_size} bytes > Discord limit {DISCORD_MAX_FILE_BYTES} bytes)*"
-        r = requests.post(TELEGRAM_DISCORD_WEBHOOK_URL, json={"content": content + note}, timeout=15)
-        if r.status_code >= 300:
-            raise RuntimeError(f"Discord webhook error: {r.status_code} {r.text}")
+        try:
+            await post_to_discord_webhook(client, json={"content": content + note})
+        except httpx.RequestError as e:
+            raise RuntimeError(f"Discord webhook request error: {e}") from e
+        except httpx.HTTPStatusError as e:
+            raise RuntimeError(
+                f"Discord webhook error: {e.response.status_code} {e.response.text}"
+            ) from e
         return
 
+    # Download file from Telegram into memory
     tg_file = await context.bot.get_file(file_id)
     buf = io.BytesIO()
     await tg_file.download_to_memory(out=buf)
     buf.seek(0)
 
+    # Discord webhook multipart upload
     payload_json = {"content": content}
-    files = {"files[0]": (filename, buf.read())}
-    data = {"payload_json": json.dumps(payload_json)}
 
-    r = requests.post(TELEGRAM_DISCORD_WEBHOOK_URL, data=data, files=files, timeout=30)
-    if r.status_code >= 300:
-        raise RuntimeError(f"Discord webhook error: {r.status_code} {r.text}")
+    try:
+        await post_to_discord_webhook(
+            client,
+            data={"payload_json": json.dumps(payload_json)},
+            files={"files[0]": (filename, buf.getvalue())},
+        )
+    except httpx.RequestError as e:
+        raise RuntimeError(f"Discord webhook request error: {e}") from e
+    except httpx.HTTPStatusError as e:
+        raise RuntimeError(
+            f"Discord webhook error: {e.response.status_code} {e.response.text}"
+        ) from e
 
 
 async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -282,7 +286,11 @@ def main() -> None:
 
     app = Application.builder().token(TG_BOT_TOKEN).build()
 
+    # Listen only to channel posts
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL, handle_channel_post))
+
+    # Gracefully close the global AsyncClient on shutdown
+    app.post_shutdown(close_http_client)
 
     log.info("Telegram bridge started. Forwarding channel posts to Discord...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
