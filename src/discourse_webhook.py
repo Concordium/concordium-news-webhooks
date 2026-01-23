@@ -1,6 +1,5 @@
 from flask import Flask, request
 import requests
-import json
 import re
 import hmac
 import hashlib
