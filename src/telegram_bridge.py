@@ -96,48 +96,131 @@ def _utf16_offset_to_py_index(s: str, utf16_offset: int) -> int:
 def _apply_telegram_entities_to_discord_markdown(text: str, entities: List[Any]) -> str:
     """
     Convert Telegram message entities to Discord-friendly Markdown.
-    Preserves hyperlinks (TEXT_LINK) by converting them to [text](url).
-    Correctly handles Telegram offsets (UTF-16) to avoid broken ranges.
+    Supports: text_link, bold, italic, underline, strikethrough, code, pre.
+    Telegram offsets are in UTF-16 code units -> converted via _utf16_offset_to_py_index.
     """
     if not text or not entities:
         return text
 
-    try:
-        ents = sorted(
-            [e for e in entities if getattr(e, "type", None) in ("text_link", "url")],
-            key=lambda e: getattr(e, "offset", 0),
-            reverse=True,
-        )
-    except Exception:
+    # Telegram entity type -> (open, close) markers
+    fmt_markers = {
+        "bold": ("**", "**"),
+        "italic": ("*", "*"),
+        "underline": ("__", "__"),
+        "strikethrough": ("~~", "~~"),
+        "code": ("`", "`"),
+    }
+
+    supported = set(fmt_markers.keys()) | {"text_link", "pre"}
+    ents = [e for e in entities if getattr(e, "type", None) in supported]
+    if not ents:
         return text
 
-    rendered = text
+    opens: dict[int, List[str]] = {}
+    closes: dict[int, List[str]] = {}
+
+    def add_open(i: int, s: str) -> None:
+        opens.setdefault(i, []).append(s)
+
+    def add_close(i: int, s: str) -> None:
+        closes.setdefault(i, []).append(s)
+
+    # Priorities for deterministic nesting when multiple markers start/end at same position.
+    # Open: outer first. Close: inner first.
+    # (This keeps patterns like **[text](url)** correct.)
+    open_priority = {
+        "pre": 0,
+        "bold": 1,
+        "italic": 2,
+        "underline": 3,
+        "strikethrough": 4,
+        "code": 5,
+        "text_link": 10,
+    }
+    close_priority = {
+        "text_link": 1,
+        "code": 5,
+        "strikethrough": 6,
+        "underline": 7,
+        "italic": 8,
+        "bold": 9,
+        "pre": 20,
+    }
+
+    # Build marker maps based on the ORIGINAL text (important for UTF-16 offsets).
     for e in ents:
         etype = getattr(e, "type", None)
-        offset = getattr(e, "offset", None)
-        length = getattr(e, "length", None)
-        if offset is None or length is None:
+        off = getattr(e, "offset", None)
+        ln = getattr(e, "length", None)
+        if off is None or ln is None:
             continue
 
-        start = _utf16_offset_to_py_index(rendered, offset)
-        end = _utf16_offset_to_py_index(rendered, offset + length)
+        start = _utf16_offset_to_py_index(text, off)
+        end = _utf16_offset_to_py_index(text, off + ln)
 
-        if start < 0 or end < 0 or start >= end or end > len(rendered):
+        if start < 0 or end < 0 or start >= end or end > len(text):
             continue
-
-        segment = rendered[start:end]
 
         if etype == "text_link":
             url = getattr(e, "url", None)
             if not url:
                 continue
-            replacement = f"[{segment}]({url})"
-            rendered = rendered[:start] + replacement + rendered[end:]
-
-        elif etype == "url":
+            add_open(start, "[")
+            add_close(end, f"]({url})")
             continue
 
-    return rendered
+        if etype == "pre":
+            # Telegram "pre" can have optional language
+            lang = getattr(e, "language", None)
+            if lang:
+                add_open(start, f"```{lang}\n")
+            else:
+                add_open(start, "```\n")
+            add_close(end, "\n```")
+            continue
+
+        if etype in fmt_markers:
+            op, cl = fmt_markers[etype]
+            add_open(start, op)
+            add_close(end, cl)
+
+    def marker_type_open(s: str) -> str:
+        if s == "[":
+            return "text_link"
+        if s.startswith("```"):
+            return "pre"
+        for k, (op, _) in fmt_markers.items():
+            if s == op:
+                return k
+        return "bold"
+
+    def marker_type_close(s: str) -> str:
+        if s.startswith("]("):
+            return "text_link"
+        if s == "\n```":
+            return "pre"
+        for k, (_, cl) in fmt_markers.items():
+            if s == cl:
+                return k
+        return "bold"
+
+    for i in opens:
+        opens[i].sort(key=lambda s: open_priority.get(marker_type_open(s), 100))
+    for i in closes:
+        closes[i].sort(key=lambda s: close_priority.get(marker_type_close(s), 100))
+
+    # Build output in one pass:
+    # close markers first, then open markers, then the character.
+    out: List[str] = []
+    for i in range(len(text) + 1):
+        if i in closes:
+            out.extend(closes[i])
+        if i in opens:
+            out.extend(opens[i])
+        if i < len(text):
+            out.append(text[i])
+
+    return "".join(out)
 
 
 def build_discord_content(update: Update) -> str:
@@ -284,13 +367,15 @@ def main() -> None:
     if not TELEGRAM_DISCORD_WEBHOOK_URL:
         raise RuntimeError("Environment variable TELEGRAM_DISCORD_WEBHOOK_URL is missing")
 
-    app = Application.builder().token(TG_BOT_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(TG_BOT_TOKEN)
+        .post_shutdown(close_http_client)
+        .build()
+    )
 
     # Listen only to channel posts
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL, handle_channel_post))
-
-    # Gracefully close the global AsyncClient on shutdown
-    app.post_shutdown(close_http_client)
 
     log.info("Telegram bridge started. Forwarding channel posts to Discord...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
